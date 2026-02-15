@@ -202,11 +202,11 @@ template:
         state_class: measurement
         state: >-
           {% set grid = states('sensor.current_grid_rate') | float(0.260) %}
-          {% set feedin = states('sensor.effective_feedin_rate') | float(0.06) %}
+          {% set feedin = states('sensor.effective_feed_in_rate') | float(0.06) %}
           {{ (grid - feedin) | round(4) }}
         availability: >-
           {{ states('sensor.current_grid_rate') not in ['unknown', 'unavailable']
-             and states('sensor.effective_feedin_rate') not in ['unknown', 'unavailable'] }}
+             and states('sensor.effective_feed_in_rate') not in ['unknown', 'unavailable'] }}
 
       # -- Spot price trend (rising / falling / stable) --------------------
       # Works with both epex_spot (price_eur_per_mwh, start_time/end_time)
