@@ -326,18 +326,21 @@ template:
 # REST sensor — fallback from spot.56k.guru
 # -----------------------------------------------------------------------------
 rest:
-  - resource: "https://spot.56k.guru/api/v2/hass"
+  - resource: "https://spot.56k.guru/api/v2/hass?area=CH&currency=EUR"
     scan_interval: 3600
-    params:
-      region: CH
     sensor:
-      - name: Spot price fallback EUR/MWh
-        unique_id: spot_price_fallback_eur_mwh
-        value_template: "{{ value_json.current_price }}"
-        unit_of_measurement: EUR/MWh
+      - name: Spot price fallback EUR/kWh
+        unique_id: spot_price_fallback_eur_kwh
+        value_template: "{{ value_json.now }}"
+        unit_of_measurement: EUR/kWh
         device_class: monetary
         state_class: measurement
         icon: mdi:flash-alert
+        json_attributes:
+          - avg
+          - min
+          - max
+          - data
 
 # -----------------------------------------------------------------------------
 # Automations
