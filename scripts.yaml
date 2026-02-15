@@ -1,0 +1,10 @@
+1769612640821':
+  sequence:
+  - device_id: 47a6546e24d2895f3c9eb8122f28e7f0
+    domain: number
+    entity_id: 4d38994cbab53ae6d235927649951507
+    type: set_value
+    value: 1
+  alias: Horace charge limit
+  description: ''
+  #                
