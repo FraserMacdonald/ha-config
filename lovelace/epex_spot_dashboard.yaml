@@ -1,0 +1,237 @@
+# =============================================================================
+# EPEX Spot Dashboard — Lovelace card configurations
+# =============================================================================
+# Prerequisites:
+#   - custom:apexcharts-card (HACS frontend)
+#   - custom:mushroom-entity-card (HACS frontend, optional but recommended)
+#   - ha_epex_spot integration configured
+#
+# Usage: Add these cards to a dashboard manually or via YAML mode.
+#   Copy individual card configs into your dashboard, or include the full
+#   view definition below.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Full view definition — add to your Lovelace views list
+# ---------------------------------------------------------------------------
+title: EPEX Spot Prices
+path: epex-spot
+icon: mdi:flash
+type: sections
+sections:
+  # =========================================================================
+  # Section 1: Status cards
+  # =========================================================================
+  - type: grid
+    title: Current Status
+    cards:
+      # -- Current spot price ------------------------------------------------
+      - type: entity
+        entity: sensor.spot_price_chf_kwh
+        name: Current Spot Price
+        icon: mdi:flash
+        state_color: true
+
+      # -- Current grid rate (time-aware) -----------------------------------
+      - type: entity
+        entity: sensor.current_grid_rate
+        name: Grid Rate (now)
+        icon: mdi:cash-clock
+
+      # -- Peak / off-peak indicator ----------------------------------------
+      - type: entity
+        entity: binary_sensor.peak_hours
+        name: Tariff Period
+        icon: mdi:clock-alert
+        attribute: current_period
+
+      # -- Effective feed-in rate --------------------------------------------
+      - type: entity
+        entity: sensor.effective_feedin_rate
+        name: Feed-in Rate
+        icon: mdi:solar-power
+
+      # -- Self-consumption savings ------------------------------------------
+      - type: entity
+        entity: sensor.self_consumption_savings
+        name: Self-use Savings
+        icon: mdi:home-lightning-bolt
+
+      # -- Price category ----------------------------------------------------
+      - type: entity
+        entity: sensor.spot_price_category
+        name: Price Category
+        icon: mdi:tag
+
+      # -- Price trend -------------------------------------------------------
+      - type: entity
+        entity: sensor.spot_price_trend
+        name: Trend
+        icon: mdi:trending-up
+
+      # -- Best sell window --------------------------------------------------
+      - type: entity
+        entity: sensor.best_export_window
+        name: Best Sell
+        icon: mdi:cash-plus
+
+      # -- Best buy window ---------------------------------------------------
+      - type: entity
+        entity: sensor.best_import_window
+        name: Best Buy
+        icon: mdi:cash-minus
+
+      # -- Today's min/max (markdown card) -----------------------------------
+      - type: markdown
+        title: Today's Range
+        content: >-
+          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+          {% if data is not none and data | length > 0 %}
+            {% set ns = namespace(min=9999, max=-9999) %}
+            {% for item in data %}
+              {% set p = item.price_eur_per_mwh %}
+              {% if p < ns.min %}{% set ns.min = p %}{% endif %}
+              {% if p > ns.max %}{% set ns.max = p %}{% endif %}
+            {% endfor %}
+          **Min:** {{ (ns.min * rate / 1000) | round(3) }} CHF/kWh
+          **Max:** {{ (ns.max * rate / 1000) | round(3) }} CHF/kWh
+          **Spread:** {{ ((ns.max - ns.min) * rate / 1000) | round(3) }}
+          **HP/HC spread:** 0.118 CHF/kWh
+          {% else %}
+          Data not available
+          {% endif %}
+
+  # =========================================================================
+  # Section 2: Hourly price chart
+  # =========================================================================
+  - type: grid
+    title: Hourly Prices
+    cards:
+      # -- ApexCharts: Today & tomorrow bar chart ----------------------------
+      - type: custom:apexcharts-card
+        header:
+          title: EPEX Spot Prices — CH
+          show: true
+          show_states: true
+          colorize_states: true
+        now:
+          show: true
+          label: Now
+          color: "#ffffff"
+        graph_span: 48h
+        span:
+          start: day
+        apex_config:
+          chart:
+            height: 350px
+          tooltip:
+            x:
+              format: "dd MMM HH:mm"
+          xaxis:
+            labels:
+              datetimeFormatter:
+                hour: HH:mm
+          yaxis:
+            - title:
+                text: CHF/kWh
+              decimalsInFloat: 3
+              min: ~0
+        series:
+          # Hourly spot price bars, colour-coded by value
+          - entity: sensor.epex_spot_data_price
+            name: Spot Price
+            type: column
+            unit: CHF/kWh
+            data_generator: >-
+              const rate = parseFloat(hass.states['input_number.eur_chf_exchange_rate']?.state || '0.94');
+              const data = entity.attributes.data || [];
+              return data.map(item => {
+                const ts = new Date(item.start_time).getTime();
+                const chf = (item.price_eur_per_mwh * rate / 1000);
+                return [ts, parseFloat(chf.toFixed(4))];
+              });
+            color_threshold:
+              - value: -0.01
+                color: "#2196F3"
+              - value: 0
+                color: "#4CAF50"
+              - value: 0.04
+                color: "#8BC34A"
+              - value: 0.08
+                color: "#FFC107"
+              - value: 0.20
+                color: "#FF9800"
+              - value: 0.30
+                color: "#F44336"
+
+          # Effective feed-in rate (floor) overlay line
+          - entity: input_number.grid_feedin_price_floor
+            name: Feed-in Floor
+            type: line
+            color: "#00BCD4"
+            stroke_width: 2
+            extend_to: end
+            transform: "return parseFloat(x);"
+
+          # Grid rate HP (peak) reference line
+          - entity: input_number.grid_rate_peak
+            name: Grid HP (17–22h)
+            type: line
+            color: "#E91E63"
+            stroke_width: 2
+            extend_to: end
+            transform: "return parseFloat(x);"
+
+          # Grid rate HC (off-peak) reference line
+          - entity: input_number.grid_rate_offpeak
+            name: Grid HC
+            type: line
+            color: "#E91E63"
+            stroke_width: 1
+            opacity: 0.5
+            extend_to: end
+            transform: "return parseFloat(x);"
+
+  # =========================================================================
+  # Section 3: Controls
+  # =========================================================================
+  - type: grid
+    title: Settings
+    cards:
+      - type: entities
+        title: Battery Control
+        show_header_toggle: false
+        entities:
+          - entity: input_boolean.spot_price_battery_control
+            name: Enable battery automations
+          - entity: input_boolean.allow_grid_charging
+            name: Allow grid charging
+          - entity: input_number.battery_reserve_soc
+            name: Battery reserve SoC
+
+      - type: entities
+        title: Grid Tariff (Romande Énergie)
+        show_header_toggle: false
+        entities:
+          - entity: input_number.grid_rate_peak
+            name: Peak rate (HP, 17–22h)
+          - entity: input_number.grid_rate_offpeak
+            name: Off-peak rate (HC)
+          - entity: sensor.current_grid_rate
+            name: Current rate
+          - entity: binary_sensor.peak_hours
+            name: Current period
+
+      - type: entities
+        title: Spot Price Thresholds
+        show_header_toggle: false
+        entities:
+          - entity: input_number.grid_sell_threshold
+            name: Sell above
+          - entity: input_number.grid_buy_threshold
+            name: Buy below
+          - entity: input_number.grid_feedin_price_floor
+            name: Feed-in floor
+          - entity: input_number.eur_chf_exchange_rate
+            name: EUR/CHF rate

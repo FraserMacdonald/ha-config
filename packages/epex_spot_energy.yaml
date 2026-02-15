@@ -1,0 +1,586 @@
+# =============================================================================
+# EPEX Spot Energy Package — Swiss Market (CH bidding zone)
+# =============================================================================
+# Tracks hourly day-ahead spot prices from EPEX via ha_epex_spot (HACS).
+# Converts EUR/MWh → CHF/kWh, calculates effective feed-in rates under
+# Swiss regulations (July 2026+), and prepares battery automations.
+#
+# Prerequisites:
+#   - ha_epex_spot HACS integration installed and configured with
+#     Energy-Charts.info as the data source, CH market area.
+#   - The integration creates sensor.epex_spot_data_price (or similar).
+#     Update the entity ID below if yours differs.
+#
+# Primary EPEX entity — change this if your integration uses a different name:
+#   sensor.epex_spot_data_price
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Input helpers — tuneable from the HA UI
+# -----------------------------------------------------------------------------
+input_number:
+  grid_feedin_price_floor:
+    name: Feed-in price floor
+    icon: mdi:arrow-down-bold-circle
+    unit_of_measurement: CHF/kWh
+    min: 0
+    max: 0.20
+    step: 0.005
+    initial: 0.06
+    mode: box
+
+  grid_rate_peak:
+    name: Grid rate peak (HP)
+    icon: mdi:cash-minus
+    unit_of_measurement: CHF/kWh
+    min: 0
+    max: 1.00
+    step: 0.001
+    initial: 0.378
+    mode: box
+
+  grid_rate_offpeak:
+    name: Grid rate off-peak (HC)
+    icon: mdi:cash-minus
+    unit_of_measurement: CHF/kWh
+    min: 0
+    max: 1.00
+    step: 0.001
+    initial: 0.260
+    mode: box
+
+  grid_sell_threshold:
+    name: Grid sell threshold
+    icon: mdi:export
+    unit_of_measurement: CHF/kWh
+    min: 0
+    max: 0.50
+    step: 0.01
+    initial: 0.12
+    mode: box
+
+  grid_buy_threshold:
+    name: Grid buy threshold
+    icon: mdi:import
+    unit_of_measurement: CHF/kWh
+    min: -0.10
+    max: 0.20
+    step: 0.005
+    initial: 0.04
+    mode: box
+
+  battery_reserve_soc:
+    name: Battery reserve SoC
+    icon: mdi:battery-low
+    unit_of_measurement: "%"
+    min: 0
+    max: 100
+    step: 5
+    initial: 20
+    mode: slider
+
+  eur_chf_exchange_rate:
+    name: EUR/CHF exchange rate
+    icon: mdi:currency-eur
+    min: 0.50
+    max: 1.50
+    step: 0.001
+    initial: 0.94
+    mode: box
+
+input_boolean:
+  spot_price_battery_control:
+    name: Spot-price battery control
+    icon: mdi:battery-sync
+
+  allow_grid_charging:
+    name: Allow grid charging at low prices
+    icon: mdi:battery-charging
+
+# -----------------------------------------------------------------------------
+# Template sensors
+# -----------------------------------------------------------------------------
+template:
+  - binary_sensor:
+      # -- Peak / off-peak indicator -----------------------------------------
+      # Tarif Double (Romande Énergie 2026+):
+      #   Peak (HP):     Mon–Fri 17:00–22:00
+      #   Off-peak (HC): Mon–Fri 00:00–17:00 & 22:00–00:00, all day Sat–Sun
+      - name: Peak hours
+        unique_id: romande_energie_peak_hours
+        icon: mdi:clock-alert
+        state: >-
+          {% set h = now().hour %}
+          {% set wd = now().weekday() %}
+          {{ wd < 5 and 17 <= h < 22 }}
+        attributes:
+          current_period: >-
+            {% set h = now().hour %}
+            {% set wd = now().weekday() %}
+            {% if wd >= 5 %}
+              Off-peak (weekend)
+            {% elif 17 <= h < 22 %}
+              Peak (17h–22h)
+            {% else %}
+              Off-peak
+            {% endif %}
+          next_change: >-
+            {% set h = now().hour %}
+            {% set wd = now().weekday() %}
+            {% if wd >= 5 %}
+              Monday 17:00
+            {% elif h < 17 %}
+              Today 17:00
+            {% elif h < 22 %}
+              Today 22:00
+            {% else %}
+              {% if wd == 4 %}Monday 17:00{% else %}Tomorrow 17:00{% endif %}
+            {% endif %}
+
+    sensor:
+      # -- Current spot price in CHF/kWh -----------------------------------
+      - name: Spot price CHF/kWh
+        unique_id: spot_price_chf_kwh
+        icon: mdi:flash
+        device_class: monetary
+        unit_of_measurement: CHF/kWh
+        state_class: measurement
+        state: >-
+          {% set eur_mwh = states('sensor.epex_spot_data_price') | float(0) %}
+          {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+          {{ (eur_mwh * rate / 1000) | round(4) }}
+        availability: >-
+          {{ states('sensor.epex_spot_data_price') not in ['unknown', 'unavailable'] }}
+
+      # -- Current grid rate based on time-of-use tariff --------------------
+      # Tarif Double: HP 0.378, HC 0.260 (2026, Énergie Suisse, Vaud, TTC)
+      - name: Current grid rate
+        unique_id: current_grid_rate
+        icon: mdi:cash-clock
+        device_class: monetary
+        unit_of_measurement: CHF/kWh
+        state_class: measurement
+        state: >-
+          {% set h = now().hour %}
+          {% set wd = now().weekday() %}
+          {% set hp = states('input_number.grid_rate_peak') | float(0.378) %}
+          {% set hc = states('input_number.grid_rate_offpeak') | float(0.260) %}
+          {% if wd < 5 and 17 <= h < 22 %}
+            {{ hp }}
+          {% else %}
+            {{ hc }}
+          {% endif %}
+
+      # -- Effective feed-in rate (max of spot price and legal floor) -------
+      - name: Effective feed-in rate
+        unique_id: effective_feedin_rate
+        icon: mdi:solar-power
+        device_class: monetary
+        unit_of_measurement: CHF/kWh
+        state_class: measurement
+        state: >-
+          {% set spot = states('sensor.spot_price_chf_kwh') | float(0) %}
+          {% set floor = states('input_number.grid_feedin_price_floor') | float(0.06) %}
+          {{ [spot, floor] | max | round(4) }}
+        availability: >-
+          {{ states('sensor.spot_price_chf_kwh') not in ['unknown', 'unavailable'] }}
+
+      # -- Self-consumption savings (value of using power vs selling it) ---
+      # Uses time-aware grid rate: saving = avoided grid cost − foregone feed-in
+      - name: Self-consumption savings
+        unique_id: self_consumption_savings
+        icon: mdi:home-lightning-bolt
+        device_class: monetary
+        unit_of_measurement: CHF/kWh
+        state_class: measurement
+        state: >-
+          {% set grid = states('sensor.current_grid_rate') | float(0.260) %}
+          {% set feedin = states('sensor.effective_feedin_rate') | float(0.06) %}
+          {{ (grid - feedin) | round(4) }}
+        availability: >-
+          {{ states('sensor.current_grid_rate') not in ['unknown', 'unavailable']
+             and states('sensor.effective_feedin_rate') not in ['unknown', 'unavailable'] }}
+
+      # -- Spot price trend (rising / falling / stable) --------------------
+      - name: Spot price trend
+        unique_id: spot_price_trend
+        icon: mdi:trending-up
+        state: >-
+          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% if data is none or data | length < 2 %}
+            unknown
+          {% else %}
+            {% set now_ts = now().timestamp() %}
+            {# Find the current hour's index #}
+            {% set ns = namespace(current_idx=-1) %}
+            {% for item in data %}
+              {% if item.start_time | as_timestamp <= now_ts < item.end_time | as_timestamp %}
+                {% set ns.current_idx = loop.index0 %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.current_idx == -1 or ns.current_idx + 3 > data | length %}
+              unknown
+            {% else %}
+              {% set current = data[ns.current_idx].price_eur_per_mwh %}
+              {% set future_prices = [] %}
+              {% set ns2 = namespace(total=0, count=0) %}
+              {% for i in range(1, [4, data | length - ns.current_idx] | min) %}
+                {% set ns2.total = ns2.total + data[ns.current_idx + i].price_eur_per_mwh %}
+                {% set ns2.count = ns2.count + 1 %}
+              {% endfor %}
+              {% if ns2.count == 0 %}
+                unknown
+              {% else %}
+                {% set avg_future = ns2.total / ns2.count %}
+                {% set diff = avg_future - current %}
+                {% if diff > 5 %}
+                  rising
+                {% elif diff < -5 %}
+                  falling
+                {% else %}
+                  stable
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+
+      # -- Spot price category ---------------------------------------------
+      - name: Spot price category
+        unique_id: spot_price_category
+        icon: mdi:tag
+        state: >-
+          {% set price = states('sensor.spot_price_chf_kwh') | float(0) %}
+          {% if price < 0 %}
+            negative
+          {% elif price < 0.04 %}
+            very_low
+          {% elif price < 0.08 %}
+            low
+          {% elif price < 0.20 %}
+            medium
+          {% elif price < 0.30 %}
+            high
+          {% else %}
+            very_high
+          {% endif %}
+        availability: >-
+          {{ states('sensor.spot_price_chf_kwh') not in ['unknown', 'unavailable'] }}
+
+      # -- Best export window today ----------------------------------------
+      - name: Best export window
+        unique_id: best_export_window
+        icon: mdi:cash-plus
+        state: >-
+          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% if data is none or data | length == 0 %}
+            unknown
+          {% else %}
+            {% set ns = namespace(max_price=-9999, max_start=none) %}
+            {% for item in data %}
+              {% if item.price_eur_per_mwh > ns.max_price %}
+                {% set ns.max_price = item.price_eur_per_mwh %}
+                {% set ns.max_start = item.start_time %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.max_start is not none %}
+              {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+              {% set chf = (ns.max_price * rate / 1000) | round(3) %}
+              {{ ns.max_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
+            {% else %}
+              unknown
+            {% endif %}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+
+      # -- Best import window today ----------------------------------------
+      - name: Best import window
+        unique_id: best_import_window
+        icon: mdi:cash-minus
+        state: >-
+          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% if data is none or data | length == 0 %}
+            unknown
+          {% else %}
+            {% set ns = namespace(min_price=9999, min_start=none) %}
+            {% for item in data %}
+              {% if item.price_eur_per_mwh < ns.min_price %}
+                {% set ns.min_price = item.price_eur_per_mwh %}
+                {% set ns.min_start = item.start_time %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.min_start is not none %}
+              {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+              {% set chf = (ns.min_price * rate / 1000) | round(3) %}
+              {{ ns.min_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
+            {% else %}
+              unknown
+            {% endif %}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+
+# -----------------------------------------------------------------------------
+# REST sensor — fallback from spot.56k.guru
+# -----------------------------------------------------------------------------
+rest:
+  - resource: "https://spot.56k.guru/api/v2/hass"
+    scan_interval: 3600
+    params:
+      region: CH
+    sensor:
+      - name: Spot price fallback EUR/MWh
+        unique_id: spot_price_fallback_eur_mwh
+        value_template: "{{ value_json.current_price }}"
+        unit_of_measurement: EUR/MWh
+        device_class: monetary
+        state_class: measurement
+        icon: mdi:flash-alert
+
+# -----------------------------------------------------------------------------
+# Automations
+# -----------------------------------------------------------------------------
+automation:
+  # -- Notify on extreme prices --------------------------------------------
+  - id: epex_notify_extreme_price
+    alias: "EPEX: Notify on extreme spot price"
+    description: Alert when spot price is negative or very high
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.spot_price_category
+        to: "negative"
+        id: "negative"
+      - platform: state
+        entity_id: sensor.spot_price_category
+        to: "very_high"
+        id: "very_high"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "negative"
+            sequence:
+              - service: persistent_notification.create
+                data:
+                  title: "Negative electricity price!"
+                  message: >-
+                    Spot price is {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh.
+                    Maximise consumption — you are being paid to use electricity.
+                  notification_id: epex_extreme_price
+              - service: notify.notify
+                data:
+                  title: "Negative electricity price!"
+                  message: >-
+                    Spot price is {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh.
+                    Maximise consumption now!
+          - conditions:
+              - condition: trigger
+                id: "very_high"
+            sequence:
+              - service: persistent_notification.create
+                data:
+                  title: "Very high electricity price!"
+                  message: >-
+                    Spot price is {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh.
+                    Minimise consumption and maximise grid export.
+                  notification_id: epex_extreme_price
+              - service: notify.notify
+                data:
+                  title: "Very high electricity price!"
+                  message: >-
+                    Spot price is {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh.
+                    Reduce consumption and export to grid.
+
+  # -- Daily price summary -------------------------------------------------
+  - id: epex_daily_summary
+    alias: "EPEX: Daily price summary"
+    description: Send a summary of today's price range each morning
+    mode: single
+    trigger:
+      - platform: time
+        at: "07:00:00"
+    action:
+      - service: notify.notify
+        data:
+          title: "EPEX daily price summary"
+          message: >-
+            {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
+            {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+            {% if data is not none and data | length > 0 %}
+              {% set ns = namespace(min=9999, max=-9999, sum=0, count=0) %}
+              {% for item in data %}
+                {% set p = item.price_eur_per_mwh %}
+                {% if p < ns.min %}{% set ns.min = p %}{% endif %}
+                {% if p > ns.max %}{% set ns.max = p %}{% endif %}
+                {% set ns.sum = ns.sum + p %}
+                {% set ns.count = ns.count + 1 %}
+              {% endfor %}
+              {% set avg_chf = (ns.sum / ns.count * rate / 1000) | round(3) %}
+              {% set min_chf = (ns.min * rate / 1000) | round(3) %}
+              {% set max_chf = (ns.max * rate / 1000) | round(3) %}
+              Today's spot prices (CHF/kWh):
+              Min: {{ min_chf }} | Avg: {{ avg_chf }} | Max: {{ max_chf }}
+              Best buy: {{ states('sensor.best_import_window') }}
+              Best sell: {{ states('sensor.best_export_window') }}
+              Grid HP: {{ states('input_number.grid_rate_peak') }} | HC: {{ states('input_number.grid_rate_offpeak') }} CHF/kWh
+              Peak hours: Mon–Fri 17:00–22:00
+            {% else %}
+              Price data not yet available.
+            {% endif %}
+
+  # =========================================================================
+  # BATTERY AUTOMATIONS — PLACEHOLDER
+  # =========================================================================
+  # These automations are ready for when a battery storage system is installed.
+  # Update the entity IDs marked with TODO to match your battery inverter's
+  # entities (e.g. from SolarEdge, Fronius, Huawei, etc.).
+  #
+  # Typical entities to configure:
+  #   - Battery SoC sensor: sensor.battery_state_of_charge
+  #   - Battery mode select/number: select.battery_operating_mode
+  #   - Battery charge command: button.force_charge / service call
+  #   - Battery discharge command: button.force_discharge / service call
+  # =========================================================================
+
+  # -- HIGH price: force export / discharge battery to grid -----------------
+  - id: epex_battery_high_price_discharge
+    alias: "EPEX Battery: High price — discharge to grid"
+    description: >-
+      When spot price exceeds the sell threshold, discharge battery to grid
+      for maximum revenue. PLACEHOLDER — update entity IDs for your battery.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        above: input_number.grid_sell_threshold
+    condition:
+      - condition: state
+        entity_id: input_boolean.spot_price_battery_control
+        state: "on"
+      # TODO: Add condition for minimum battery SoC
+      # - condition: numeric_state
+      #   entity_id: sensor.battery_state_of_charge
+      #   above: input_number.battery_reserve_soc
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery: High price mode"
+          message: >-
+            Spot price {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh
+            exceeds sell threshold. Battery should discharge to grid.
+          notification_id: epex_battery_mode
+      # TODO: Uncomment and configure for your battery system
+      # - service: select.select_option
+      #   target:
+      #     entity_id: select.battery_operating_mode
+      #   data:
+      #     option: "Force Discharge"
+
+  # -- LOW price: charge battery from grid ----------------------------------
+  - id: epex_battery_low_price_charge
+    alias: "EPEX Battery: Low price — charge from grid"
+    description: >-
+      When spot price drops below the buy threshold and grid charging is
+      allowed, charge battery from grid. PLACEHOLDER — update entity IDs.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        below: input_number.grid_buy_threshold
+    condition:
+      - condition: state
+        entity_id: input_boolean.spot_price_battery_control
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.allow_grid_charging
+        state: "on"
+      # TODO: Add condition for battery not already full
+      # - condition: numeric_state
+      #   entity_id: sensor.battery_state_of_charge
+      #   below: 95
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery: Low price mode"
+          message: >-
+            Spot price {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh
+            is below buy threshold. Battery should charge from grid.
+          notification_id: epex_battery_mode
+      # TODO: Uncomment and configure for your battery system
+      # - service: select.select_option
+      #   target:
+      #     entity_id: select.battery_operating_mode
+      #   data:
+      #     option: "Force Charge"
+
+  # -- MEDIUM price: normal self-consumption --------------------------------
+  - id: epex_battery_normal_mode
+    alias: "EPEX Battery: Medium price — normal mode"
+    description: >-
+      When spot price is in the normal range, operate battery in standard
+      self-consumption mode. PLACEHOLDER — update entity IDs.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        above: input_number.grid_buy_threshold
+      - platform: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        below: input_number.grid_sell_threshold
+    condition:
+      - condition: state
+        entity_id: input_boolean.spot_price_battery_control
+        state: "on"
+      - condition: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        above: input_number.grid_buy_threshold
+      - condition: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        below: input_number.grid_sell_threshold
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery: Normal mode"
+          message: >-
+            Spot price {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh
+            is in normal range. Battery in self-consumption mode.
+          notification_id: epex_battery_mode
+      # TODO: Uncomment and configure for your battery system
+      # - service: select.select_option
+      #   target:
+      #     entity_id: select.battery_operating_mode
+      #   data:
+      #     option: "Self Consumption"
+
+  # -- NEGATIVE price: maximise grid import ---------------------------------
+  - id: epex_battery_negative_price
+    alias: "EPEX Battery: Negative price — maximise import"
+    description: >-
+      When spot price goes negative, charge everything from grid.
+      PLACEHOLDER — update entity IDs.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.spot_price_chf_kwh
+        below: 0
+    condition:
+      - condition: state
+        entity_id: input_boolean.spot_price_battery_control
+        state: "on"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery: Negative price — charge everything!"
+          message: >-
+            Spot price is NEGATIVE at {{ states('sensor.spot_price_chf_kwh') }} CHF/kWh.
+            Charging battery and maximising grid import.
+          notification_id: epex_battery_mode
+      # TODO: Uncomment and configure for your battery system
+      # - service: select.select_option
+      #   target:
+      #     entity_id: select.battery_operating_mode
+      #   data:
+      #     option: "Force Charge"
