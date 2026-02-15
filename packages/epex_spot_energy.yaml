@@ -139,6 +139,7 @@ template:
 
     sensor:
       # -- Current spot price in CHF/kWh -----------------------------------
+      # Prefers ha_epex_spot (EUR/MWh); falls back to REST sensor (EUR/kWh)
       - name: Spot price CHF/kWh
         unique_id: spot_price_chf_kwh
         icon: mdi:flash
@@ -146,11 +147,17 @@ template:
         unit_of_measurement: CHF/kWh
         state_class: measurement
         state: >-
-          {% set eur_mwh = states('sensor.epex_spot_data_price') | float(0) %}
           {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
-          {{ (eur_mwh * rate / 1000) | round(4) }}
+          {% set epex = states('sensor.epex_spot_data_price') %}
+          {% if epex not in ['unknown', 'unavailable'] %}
+            {{ (epex | float(0) * rate / 1000) | round(4) }}
+          {% else %}
+            {% set fb = states('sensor.spot_price_fallback_eur_kwh') %}
+            {{ (fb | float(0) * rate) | round(4) }}
+          {% endif %}
         availability: >-
-          {{ states('sensor.epex_spot_data_price') not in ['unknown', 'unavailable'] }}
+          {{ states('sensor.epex_spot_data_price') not in ['unknown', 'unavailable']
+             or states('sensor.spot_price_fallback_eur_kwh') not in ['unknown', 'unavailable'] }}
 
       # -- Current grid rate based on time-of-use tariff --------------------
       # Tarif Double: HP 0.378, HC 0.260 (2026, Énergie Suisse, Vaud, TTC)
@@ -202,30 +209,53 @@ template:
              and states('sensor.effective_feedin_rate') not in ['unknown', 'unavailable'] }}
 
       # -- Spot price trend (rising / falling / stable) --------------------
+      # Works with both epex_spot (price_eur_per_mwh, start_time/end_time)
+      # and fallback REST sensor (p, st) data formats
       - name: Spot price trend
         unique_id: spot_price_trend
         icon: mdi:trending-up
         state: >-
-          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
-          {% if data is none or data | length < 2 %}
+          {% set epex_data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% set fb_data = state_attr('sensor.spot_price_fallback_eur_kwh', 'data') %}
+          {% if epex_data is not none and epex_data | length > 1 %}
+            {% set data = epex_data %}
+            {% set use_epex = true %}
+          {% elif fb_data is not none and fb_data | length > 1 %}
+            {% set data = fb_data %}
+            {% set use_epex = false %}
+          {% else %}
+            {% set data = none %}
+          {% endif %}
+          {% if data is none %}
             unknown
           {% else %}
             {% set now_ts = now().timestamp() %}
-            {# Find the current hour's index #}
             {% set ns = namespace(current_idx=-1) %}
             {% for item in data %}
-              {% if item.start_time | as_timestamp <= now_ts < item.end_time | as_timestamp %}
+              {% if use_epex is defined and use_epex %}
+                {% set item_ts = item.start_time | as_timestamp %}
+              {% else %}
+                {% set item_ts = item.st | as_timestamp %}
+              {% endif %}
+              {% if item_ts <= now_ts < item_ts + 3600 %}
                 {% set ns.current_idx = loop.index0 %}
               {% endif %}
             {% endfor %}
             {% if ns.current_idx == -1 or ns.current_idx + 3 > data | length %}
               unknown
             {% else %}
-              {% set current = data[ns.current_idx].price_eur_per_mwh %}
-              {% set future_prices = [] %}
+              {% if use_epex is defined and use_epex %}
+                {% set current = data[ns.current_idx].price_eur_per_mwh %}
+              {% else %}
+                {% set current = data[ns.current_idx].p | float %}
+              {% endif %}
               {% set ns2 = namespace(total=0, count=0) %}
               {% for i in range(1, [4, data | length - ns.current_idx] | min) %}
-                {% set ns2.total = ns2.total + data[ns.current_idx + i].price_eur_per_mwh %}
+                {% if use_epex is defined and use_epex %}
+                  {% set ns2.total = ns2.total + data[ns.current_idx + i].price_eur_per_mwh %}
+                {% else %}
+                  {% set ns2.total = ns2.total + data[ns.current_idx + i].p | float %}
+                {% endif %}
                 {% set ns2.count = ns2.count + 1 %}
               {% endfor %}
               {% if ns2.count == 0 %}
@@ -233,18 +263,17 @@ template:
               {% else %}
                 {% set avg_future = ns2.total / ns2.count %}
                 {% set diff = avg_future - current %}
-                {% if diff > 5 %}
-                  rising
-                {% elif diff < -5 %}
-                  falling
+                {% if use_epex is defined and use_epex %}
+                  {% if diff > 5 %}rising{% elif diff < -5 %}falling{% else %}stable{% endif %}
                 {% else %}
-                  stable
+                  {% if diff > 0.005 %}rising{% elif diff < -0.005 %}falling{% else %}stable{% endif %}
                 {% endif %}
               {% endif %}
             {% endif %}
           {% endif %}
         availability: >-
-          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none
+             or state_attr('sensor.spot_price_fallback_eur_kwh', 'data') is not none }}
 
       # -- Spot price category ---------------------------------------------
       - name: Spot price category
@@ -269,58 +298,92 @@ template:
           {{ states('sensor.spot_price_chf_kwh') not in ['unknown', 'unavailable'] }}
 
       # -- Best export window today ----------------------------------------
+      # Works with both epex_spot and fallback data formats
       - name: Best export window
         unique_id: best_export_window
         icon: mdi:cash-plus
         state: >-
-          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
-          {% if data is none or data | length == 0 %}
-            unknown
-          {% else %}
+          {% set epex_data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% set fb_data = state_attr('sensor.spot_price_fallback_eur_kwh', 'data') %}
+          {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+          {% if epex_data is not none and epex_data | length > 0 %}
             {% set ns = namespace(max_price=-9999, max_start=none) %}
-            {% for item in data %}
+            {% for item in epex_data %}
               {% if item.price_eur_per_mwh > ns.max_price %}
                 {% set ns.max_price = item.price_eur_per_mwh %}
                 {% set ns.max_start = item.start_time %}
               {% endif %}
             {% endfor %}
             {% if ns.max_start is not none %}
-              {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
               {% set chf = (ns.max_price * rate / 1000) | round(3) %}
               {{ ns.max_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
             {% else %}
               unknown
             {% endif %}
+          {% elif fb_data is not none and fb_data | length > 0 %}
+            {% set ns = namespace(max_price=-9999, max_start=none) %}
+            {% for item in fb_data %}
+              {% if item.p | float > ns.max_price %}
+                {% set ns.max_price = item.p | float %}
+                {% set ns.max_start = item.st %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.max_start is not none %}
+              {% set chf = (ns.max_price * rate) | round(3) %}
+              {{ ns.max_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
+            {% else %}
+              unknown
+            {% endif %}
+          {% else %}
+            unknown
           {% endif %}
         availability: >-
-          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none
+             or state_attr('sensor.spot_price_fallback_eur_kwh', 'data') is not none }}
 
       # -- Best import window today ----------------------------------------
+      # Works with both epex_spot and fallback data formats
       - name: Best import window
         unique_id: best_import_window
         icon: mdi:cash-minus
         state: >-
-          {% set data = state_attr('sensor.epex_spot_data_price', 'data') %}
-          {% if data is none or data | length == 0 %}
-            unknown
-          {% else %}
+          {% set epex_data = state_attr('sensor.epex_spot_data_price', 'data') %}
+          {% set fb_data = state_attr('sensor.spot_price_fallback_eur_kwh', 'data') %}
+          {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
+          {% if epex_data is not none and epex_data | length > 0 %}
             {% set ns = namespace(min_price=9999, min_start=none) %}
-            {% for item in data %}
+            {% for item in epex_data %}
               {% if item.price_eur_per_mwh < ns.min_price %}
                 {% set ns.min_price = item.price_eur_per_mwh %}
                 {% set ns.min_start = item.start_time %}
               {% endif %}
             {% endfor %}
             {% if ns.min_start is not none %}
-              {% set rate = states('input_number.eur_chf_exchange_rate') | float(0.94) %}
               {% set chf = (ns.min_price * rate / 1000) | round(3) %}
               {{ ns.min_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
             {% else %}
               unknown
             {% endif %}
+          {% elif fb_data is not none and fb_data | length > 0 %}
+            {% set ns = namespace(min_price=9999, min_start=none) %}
+            {% for item in fb_data %}
+              {% if item.p | float < ns.min_price %}
+                {% set ns.min_price = item.p | float %}
+                {% set ns.min_start = item.st %}
+              {% endif %}
+            {% endfor %}
+            {% if ns.min_start is not none %}
+              {% set chf = (ns.min_price * rate) | round(3) %}
+              {{ ns.min_start | as_timestamp | timestamp_custom('%H:%M') }} ({{ chf }} CHF/kWh)
+            {% else %}
+              unknown
+            {% endif %}
+          {% else %}
+            unknown
           {% endif %}
         availability: >-
-          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none }}
+          {{ state_attr('sensor.epex_spot_data_price', 'data') is not none
+             or state_attr('sensor.spot_price_fallback_eur_kwh', 'data') is not none }}
 
 # -----------------------------------------------------------------------------
 # REST sensor — fallback from spot.56k.guru
